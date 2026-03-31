@@ -1,8 +1,21 @@
-pydicom>=2.4.0
-PySide6>=6.6.0
-opencv-python>=4.9.0
-easyocr>=1.7.0
-Pillow>=10.0.0
-pylibjpeg>=2.0.0
-pylibjpeg-libjpeg>=2.1.0
-pylibjpeg-openjpeg>=2.1.0
+# DICOM Anonymizer — Globus Medical
+# Install: pip install -r requirements.txt
+
+# Core (required)
+pydicom==2.4.4
+PySide6==6.10.2
+numpy==2.0.2
+
+# DICOM JPEG codec support
+pylibjpeg==2.0.1
+pylibjpeg-libjpeg==2.3.0
+pylibjpeg-openjpeg==2.5.0
+
+# Pixel scrubbing — optional, app works without these
+# Install separately: pip install opencv-python-headless easyocr
+opencv-python-headless==4.13.0
+easyocr==1.7.2
+torch==2.8.0
+
+# Packaging (dev only)
+# pip install pyinstaller==6.19.0

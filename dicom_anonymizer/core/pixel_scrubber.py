@@ -8,6 +8,7 @@ Detects and redacts:
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,12 +29,24 @@ except ImportError:
 from pydicom.dataset import Dataset
 
 
-# Default Haar cascade path (from CaseAnonymizer-R)
-_DEFAULT_CASCADE = (
-    Path(__file__).resolve().parent.parent.parent
-    / "CaseAnonymizer-R" / "bin" / "models" / "RGB-FaceDetection"
-    / "haarcascade_frontalface_alt.xml"
-)
+# Default Haar cascade path — checks PyInstaller bundle first, then dev layout
+def _find_cascade() -> Path:
+    """Locate the Haar cascade model file."""
+    # PyInstaller bundle path
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        p = Path(base) / "CaseAnonymizer-R" / "bin" / "models" / "RGB-FaceDetection" / "haarcascade_frontalface_alt.xml"
+        if p.exists():
+            return p
+
+    # Development layout (relative to this source file)
+    p = (Path(__file__).resolve().parent.parent.parent
+         / "CaseAnonymizer-R" / "bin" / "models" / "RGB-FaceDetection"
+         / "haarcascade_frontalface_alt.xml")
+    return p
+
+
+_DEFAULT_CASCADE = _find_cascade()
 
 # Modalities where face detection is relevant
 _FACE_MODALITIES = {"CT", "MR", "PT", "NM", "XA"}

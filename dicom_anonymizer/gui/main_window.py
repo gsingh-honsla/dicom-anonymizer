@@ -22,8 +22,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSplitter,
     QTabWidget,
+    QMenuBar,
 )
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QFont, QTextCursor, QAction
 
 from ..core.scanner import scan_directory, get_patient_study_counts, ScanResult
 from ..core.anonymizer import Anonymizer, AnonymizationResult
@@ -32,6 +33,7 @@ from ..audit.logger import AuditLogger
 from ..verification.verifier import Verifier, VerificationSummary
 from ..verification.report import export_html, export_json
 from ..core.dicomdir_handler import has_dicomdir, generate_dicomdir
+from ..core.pixel_scrubber import check_availability as check_pixel_scrub
 from ..utils.config import AnonymizationConfig, APP_NAME, APP_VERSION, APP_ORG
 
 from .summary_panel import SummaryPanel
@@ -165,8 +167,44 @@ class MainWindow(QMainWindow):
         self._start_time: float = 0
 
         self._setup_ui()
+        self._setup_menu()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {APP_ORG}")
         self.resize(1100, 750)
+
+    def _setup_menu(self):
+        """Create the application menu bar."""
+        menubar = self.menuBar()
+
+        # Help menu
+        help_menu = menubar.addMenu("Help")
+
+        about_action = QAction(f"About {APP_NAME}", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    def _show_about(self):
+        """Show the About dialog with version and dependency info."""
+        pixel_status = check_pixel_scrub()
+        ocr_status = "Available" if pixel_status["ocr"] else "Not installed (pip install easyocr)"
+        face_status = "Available" if pixel_status["face_detection"] else "Not available"
+        opencv_status = "Available" if pixel_status["opencv"] else "Not installed (pip install opencv-python-headless)"
+
+        QMessageBox.about(
+            self,
+            f"About {APP_NAME}",
+            f"<h3>{APP_NAME} v{APP_VERSION}</h3>"
+            f"<p>{APP_ORG}</p>"
+            f"<p>HIPAA-compliant DICOM anonymization tool for medical imaging data.</p>"
+            f"<hr>"
+            f"<p><b>Capabilities:</b></p>"
+            f"<ul>"
+            f"<li>Tag anonymization: PS3.15 Annex E Basic Profile</li>"
+            f"<li>OCR text detection: {ocr_status}</li>"
+            f"<li>Face detection: {face_status}</li>"
+            f"<li>OpenCV: {opencv_status}</li>"
+            f"</ul>"
+            f"<p><small>Built with Python, pydicom, PySide6</small></p>"
+        )
 
     def _setup_ui(self):
         central = QWidget()
@@ -267,9 +305,7 @@ class MainWindow(QMainWindow):
 
         self.chk_pixel_scrub = QCheckBox("Pixel scrubbing (OCR + face)")
         self.chk_pixel_scrub.setChecked(self.config.pixel_scrub)
-        self.chk_pixel_scrub.toggled.connect(
-            lambda v: setattr(self.config, "pixel_scrub", v)
-        )
+        self.chk_pixel_scrub.toggled.connect(self._on_pixel_scrub_toggled)
         layout.addWidget(self.chk_pixel_scrub)
 
         self.chk_keep_dates = QCheckBox("Keep dates")
@@ -345,6 +381,28 @@ class MainWindow(QMainWindow):
         return group
 
     # ── Slots ──────────────────────────────────────────────────
+
+    def _on_pixel_scrub_toggled(self, checked: bool):
+        """Handle pixel scrubbing checkbox toggle with dependency check."""
+        if checked:
+            status = check_pixel_scrub()
+            missing = []
+            if not status["ocr"]:
+                missing.append("easyocr (OCR text detection)")
+            if not status["opencv"]:
+                missing.append("opencv-python-headless (face detection)")
+            elif not status["face_detection"]:
+                missing.append("Haar cascade model (face detection)")
+
+            if missing:
+                QMessageBox.warning(
+                    self,
+                    "Pixel Scrubbing",
+                    "Some pixel scrubbing features are unavailable:\n\n"
+                    + "\n".join(f"  - {m}" for m in missing)
+                    + "\n\nAvailable features will still be used.",
+                )
+        self.config.pixel_scrub = checked
 
     def _select_source(self):
         folder = QFileDialog.getExistingDirectory(
