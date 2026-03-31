@@ -1,0 +1,425 @@
+"""Main application window for the DICOM Anonymizer."""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGroupBox,
+    QPushButton,
+    QLabel,
+    QFileDialog,
+    QProgressBar,
+    QTextEdit,
+    QCheckBox,
+    QMessageBox,
+    QSplitter,
+)
+from PySide6.QtGui import QFont, QTextCursor
+
+from ..core.scanner import scan_directory, get_patient_study_counts, ScanResult
+from ..core.anonymizer import Anonymizer, AnonymizationResult
+from ..core.writer import write_anonymized
+from ..audit.logger import AuditLogger
+from ..utils.config import AnonymizationConfig, APP_NAME, APP_VERSION, APP_ORG
+
+
+class AnonymizationWorker(QObject):
+    """Worker that runs anonymization in a background thread."""
+
+    progress = Signal(int, int, str)    # current, total, message
+    file_done = Signal(str, bool)       # filename, success
+    log_message = Signal(str)           # log line
+    finished = Signal(int, int, int)    # processed, failed, private_tags_total
+    error = Signal(str)                 # fatal error message
+
+    def __init__(
+        self,
+        scan_result: ScanResult,
+        config: AnonymizationConfig,
+        cancel_event: threading.Event,
+    ):
+        super().__init__()
+        self.scan_result = scan_result
+        self.config = config
+        self.cancel_event = cancel_event
+
+    def run(self):
+        """Execute the anonymization batch."""
+        try:
+            self._run_batch()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _run_batch(self):
+        anonymizer = Anonymizer(self.config)
+        db_path = self.config.output_dir / "audit.db"
+        audit = AuditLogger(db_path)
+
+        files = self.scan_result.dicom_files
+        total = len(files)
+        run_id = audit.start_run(self.config.source_dir, self.config.output_dir, total)
+
+        processed = 0
+        failed = 0
+        total_private = 0
+
+        for i, file_path in enumerate(files):
+            if self.cancel_event.is_set():
+                self.log_message.emit("Cancelled by user.")
+                audit.fail_run(run_id, processed, failed)
+                self.finished.emit(processed, failed, total_private)
+                return
+
+            rel_name = file_path.name
+            self.progress.emit(i + 1, total, rel_name)
+
+            ds, result = anonymizer.anonymize_file(file_path)
+
+            if result.success and ds is not None:
+                try:
+                    output_path, file_hash = write_anonymized(
+                        ds,
+                        file_path,
+                        self.config.source_dir,
+                        self.config.output_dir,
+                    )
+                    audit.log_file(run_id, result, output_path, file_hash)
+                    processed += 1
+                    total_private += result.private_tags_removed
+
+                    msg = f"OK {rel_name}: {len(result.tags_modified)} modified, {len(result.tags_removed)} removed, {len(result.uids_replaced)} UIDs"
+                    if result.private_tags_removed:
+                        msg += f", {result.private_tags_removed} private"
+                    self.log_message.emit(msg)
+
+                except Exception as e:
+                    result.success = False
+                    result.error = str(e)
+                    audit.log_file(run_id, result)
+                    failed += 1
+                    self.log_message.emit(f"WRITE ERROR {rel_name}: {e}")
+            else:
+                audit.log_file(run_id, result)
+                failed += 1
+                self.log_message.emit(f"FAIL {rel_name}: {result.error}")
+
+            self.file_done.emit(rel_name, result.success)
+
+        audit.complete_run(run_id, processed, failed)
+        audit.close()
+        self.finished.emit(processed, failed, total_private)
+
+
+class MainWindow(QMainWindow):
+    """Main application window with three-panel layout."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = AnonymizationConfig()
+        self.scan_result: ScanResult | None = None
+        self._worker_thread: QThread | None = None
+        self._cancel_event = threading.Event()
+
+        self._setup_ui()
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {APP_ORG}")
+        self.resize(1000, 700)
+
+    def _setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+
+        # Left panel
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(self._create_source_group())
+        left_panel.addWidget(self._create_output_group())
+        left_panel.addWidget(self._create_options_group())
+        left_panel.addStretch()
+
+        left_widget = QWidget()
+        left_widget.setLayout(left_panel)
+        left_widget.setFixedWidth(260)
+
+        # Right panel
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(self._create_status_group())
+        right_panel.addWidget(self._create_log_group(), stretch=1)
+        right_panel.addWidget(self._create_actions_group())
+
+        right_widget = QWidget()
+        right_widget.setLayout(right_panel)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        main_layout.addWidget(splitter)
+
+    def _create_source_group(self) -> QGroupBox:
+        group = QGroupBox("Source")
+        layout = QVBoxLayout(group)
+
+        self.btn_select_source = QPushButton("Select Folder...")
+        self.btn_select_source.clicked.connect(self._select_source)
+        layout.addWidget(self.btn_select_source)
+
+        self.lbl_source_path = QLabel("No folder selected")
+        self.lbl_source_path.setWordWrap(True)
+        layout.addWidget(self.lbl_source_path)
+
+        self.lbl_source_info = QLabel("")
+        self.lbl_source_info.setStyleSheet("color: #666;")
+        layout.addWidget(self.lbl_source_info)
+
+        return group
+
+    def _create_output_group(self) -> QGroupBox:
+        group = QGroupBox("Output")
+        layout = QVBoxLayout(group)
+
+        self.btn_select_output = QPushButton("Select Folder...")
+        self.btn_select_output.clicked.connect(self._select_output)
+        layout.addWidget(self.btn_select_output)
+
+        self.lbl_output_path = QLabel(str(self.config.output_dir))
+        self.lbl_output_path.setWordWrap(True)
+        layout.addWidget(self.lbl_output_path)
+
+        return group
+
+    def _create_options_group(self) -> QGroupBox:
+        group = QGroupBox("Options")
+        layout = QVBoxLayout(group)
+
+        self.chk_strip_private = QCheckBox("Strip private tags")
+        self.chk_strip_private.setChecked(self.config.strip_private_tags)
+        self.chk_strip_private.toggled.connect(
+            lambda v: setattr(self.config, "strip_private_tags", v)
+        )
+        layout.addWidget(self.chk_strip_private)
+
+        self.chk_pixel_scrub = QCheckBox("Pixel scrubbing (Phase 3)")
+        self.chk_pixel_scrub.setChecked(False)
+        self.chk_pixel_scrub.setEnabled(False)
+        layout.addWidget(self.chk_pixel_scrub)
+
+        self.chk_keep_dates = QCheckBox("Keep dates")
+        self.chk_keep_dates.setChecked(self.config.keep_dates)
+        self.chk_keep_dates.toggled.connect(
+            lambda v: setattr(self.config, "keep_dates", v)
+        )
+        layout.addWidget(self.chk_keep_dates)
+
+        self.chk_auto_verify = QCheckBox("Auto-verify output")
+        self.chk_auto_verify.setChecked(self.config.auto_verify)
+        self.chk_auto_verify.setEnabled(False)  # Phase 2
+        layout.addWidget(self.chk_auto_verify)
+
+        return group
+
+    def _create_status_group(self) -> QGroupBox:
+        group = QGroupBox("Status")
+        layout = QVBoxLayout(group)
+
+        self.lbl_status = QLabel("Ready")
+        self.lbl_status.setFont(QFont("", 12, QFont.Bold))
+        layout.addWidget(self.lbl_status)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.lbl_progress_detail = QLabel("")
+        self.lbl_progress_detail.setStyleSheet("color: #666;")
+        layout.addWidget(self.lbl_progress_detail)
+
+        return group
+
+    def _create_log_group(self) -> QGroupBox:
+        group = QGroupBox("Log")
+        layout = QVBoxLayout(group)
+
+        self.txt_log = QTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setFont(QFont("Menlo", 10))
+        layout.addWidget(self.txt_log)
+
+        return group
+
+    def _create_actions_group(self) -> QGroupBox:
+        group = QGroupBox("Actions")
+        layout = QHBoxLayout(group)
+
+        self.btn_start = QPushButton("Start Anonymization")
+        self.btn_start.setEnabled(False)
+        self.btn_start.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; padding: 8px 16px; font-weight: bold; }"
+            "QPushButton:disabled { background-color: #ccc; color: #666; }"
+            "QPushButton:hover:!disabled { background-color: #1976D2; }"
+        )
+        self.btn_start.clicked.connect(self._start_anonymization)
+        layout.addWidget(self.btn_start)
+
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel_anonymization)
+        layout.addWidget(self.btn_cancel)
+
+        self.btn_open_output = QPushButton("Open Output")
+        self.btn_open_output.setEnabled(False)
+        self.btn_open_output.clicked.connect(self._open_output_folder)
+        layout.addWidget(self.btn_open_output)
+
+        return group
+
+    # ── Slots ──────────────────────────────────────────────────
+
+    def _select_source(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select DICOM Source Folder", str(Path.home())
+        )
+        if not folder:
+            return
+
+        self.config.source_dir = Path(folder)
+        self.lbl_source_path.setText(folder)
+        self.lbl_source_info.setText("Scanning...")
+        self.lbl_status.setText("Scanning for DICOM files...")
+        self.btn_start.setEnabled(False)
+
+        # Scan in the main thread (fast enough for typical datasets)
+        self.scan_result = scan_directory(self.config.source_dir)
+
+        if self.scan_result.file_count == 0:
+            self.lbl_source_info.setText("No DICOM files found")
+            self.lbl_status.setText("Ready")
+            return
+
+        # Get patient/study counts
+        self.lbl_source_info.setText(f"Counting patients/studies...")
+        counts = get_patient_study_counts(self.scan_result.dicom_files)
+
+        info = (
+            f"Files: {counts['files']}\n"
+            f"Patients: {counts['patients']}\n"
+            f"Studies: {counts['studies']}\n"
+            f"Size: {self.scan_result.total_size_bytes / (1024 * 1024):.0f} MB"
+        )
+        self.lbl_source_info.setText(info)
+        self.lbl_status.setText("Ready — select output and start")
+        self.btn_start.setEnabled(True)
+
+        self._log(f"Scanned {folder}")
+        self._log(f"Found {counts['files']} DICOM files, {counts['patients']} patients, {counts['studies']} studies")
+        if self.scan_result.skipped_files:
+            self._log(f"Skipped {len(self.scan_result.skipped_files)} non-DICOM files")
+        if self.scan_result.errors:
+            self._log(f"Errors: {len(self.scan_result.errors)}")
+
+    def _select_output(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", str(self.config.output_dir)
+        )
+        if folder:
+            self.config.output_dir = Path(folder)
+            self.lbl_output_path.setText(folder)
+
+    def _start_anonymization(self):
+        if not self.scan_result or self.scan_result.file_count == 0:
+            return
+
+        # Ensure output directory exists
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Reset UI
+        self.progress_bar.setMaximum(self.scan_result.file_count)
+        self.progress_bar.setValue(0)
+        self.btn_start.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.btn_open_output.setEnabled(False)
+        self._cancel_event.clear()
+
+        self.lbl_status.setText("Anonymizing...")
+        self._log("=" * 50)
+        self._log("Starting anonymization...")
+
+        # Create worker
+        self._worker_thread = QThread()
+        self._worker = AnonymizationWorker(
+            self.scan_result, self.config, self._cancel_event
+        )
+        self._worker.moveToThread(self._worker_thread)
+
+        # Connect signals
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.log_message.connect(self._log)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+
+        self._worker_thread.start()
+
+    def _cancel_anonymization(self):
+        self._cancel_event.set()
+        self.lbl_status.setText("Cancelling...")
+        self.btn_cancel.setEnabled(False)
+
+    def _on_progress(self, current: int, total: int, filename: str):
+        self.progress_bar.setValue(current)
+        self.lbl_progress_detail.setText(f"{current} / {total}: {filename}")
+
+    def _on_finished(self, processed: int, failed: int, private_tags: int):
+        self._cleanup_worker()
+        self.btn_start.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.btn_open_output.setEnabled(True)
+
+        status = "Complete" if not self._cancel_event.is_set() else "Cancelled"
+        self.lbl_status.setText(status)
+
+        self._log("=" * 50)
+        self._log(f"{status}: {processed} files processed, {failed} failed")
+        self._log(f"Private tags removed: {private_tags}")
+        self._log(f"Output: {self.config.output_dir}")
+        self._log(f"Audit log: {self.config.output_dir / 'audit.db'}")
+
+        if failed > 0:
+            QMessageBox.warning(
+                self,
+                "Anonymization Complete",
+                f"Completed with {failed} failures.\nCheck the log for details.",
+            )
+
+    def _on_error(self, message: str):
+        self._cleanup_worker()
+        self.btn_start.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.lbl_status.setText("Error")
+        self._log(f"FATAL ERROR: {message}")
+        QMessageBox.critical(self, "Error", message)
+
+    def _cleanup_worker(self):
+        if self._worker_thread and self._worker_thread.isRunning():
+            self._worker_thread.quit()
+            self._worker_thread.wait()
+        self._worker_thread = None
+
+    def _open_output_folder(self):
+        import subprocess
+        subprocess.Popen(["open", str(self.config.output_dir)])
+
+    def _log(self, message: str):
+        self.txt_log.append(message)
+        # Auto-scroll to bottom
+        cursor = self.txt_log.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.txt_log.setTextCursor(cursor)
