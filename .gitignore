@@ -1,0 +1,36 @@
+# Large binary data - do NOT push to GitHub
+DICOM Test Case/
+CaseAnonymizer-R/
+
+# macOS
+.DS_Store
+*.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PyInstaller
+*.app
+*.dmg
+
+# SQLite audit databases
+*.db
+*.sqlite
+
+# Environment variables
+.env
