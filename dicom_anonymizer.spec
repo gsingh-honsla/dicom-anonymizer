@@ -128,7 +128,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="DICOM Anonymizer.app",
-    icon=None,  # TODO: Add app icon (.icns file)
+    icon=os.path.join(PROJECT_ROOT, "app_icon.icns"),
     bundle_identifier="com.globusmedical.dicom-anonymizer",
     info_plist={
         "CFBundleDisplayName": "DICOM Anonymizer",
