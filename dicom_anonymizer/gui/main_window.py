@@ -170,6 +170,34 @@ class VerificationWorker(QObject):
             self.error.emit(str(e))
 
 
+class PostProcessingWorker(QObject):
+    """Worker for DICOMDIR generation and viewer loading (avoids beach ball)."""
+
+    log_message = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, config: AnonymizationConfig, has_source_dicomdir: bool):
+        super().__init__()
+        self.config = config
+        self.has_source_dicomdir = has_source_dicomdir
+
+    def run(self):
+        try:
+            # Generate DICOMDIR if original had one
+            if self.has_source_dicomdir:
+                self.log_message.emit("Generating DICOMDIR for output...")
+                try:
+                    dicomdir_path = generate_dicomdir(self.config.output_dir)
+                    self.log_message.emit(f"DICOMDIR written: {dicomdir_path}")
+                except Exception as e:
+                    self.log_message.emit(f"DICOMDIR generation failed: {e}")
+
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     """Main application window with three-panel layout."""
 
@@ -571,21 +599,6 @@ class MainWindow(QMainWindow):
             processed, failed, private_tags, elapsed_str
         )
 
-        # Generate DICOMDIR if original had one
-        if (self.scan_result and
-                has_dicomdir(self.config.source_dir) and
-                processed > 0 and
-                not self._cancel_event.is_set()):
-            self._log("Generating DICOMDIR for output...")
-            try:
-                dicomdir_path = generate_dicomdir(self.config.output_dir)
-                self._log(f"DICOMDIR written: {dicomdir_path}")
-            except Exception as e:
-                self._log(f"DICOMDIR generation failed: {e}")
-
-        # Load anonymized files into viewers
-        self._load_output_viewers()
-
         if failed > 0:
             QMessageBox.warning(
                 self,
@@ -593,12 +606,8 @@ class MainWindow(QMainWindow):
                 f"Completed with {failed} failures.\nCheck the log for details.",
             )
 
-        # Auto-verify if enabled
-        if self.config.auto_verify and processed > 0:
-            self._run_verification()
-        else:
-            # Switch to summary tab
-            self.right_tabs.setCurrentIndex(1)
+        # Run post-processing on a background thread to avoid beach ball
+        self._run_post_processing(processed)
 
     def _on_error(self, message: str):
         self._cleanup_worker()
@@ -613,6 +622,49 @@ class MainWindow(QMainWindow):
             self._worker_thread.quit()
             self._worker_thread.wait()
         self._worker_thread = None
+
+    # ── Post-processing (DICOMDIR + viewer loading) ─────────
+
+    def _run_post_processing(self, processed: int):
+        """Run DICOMDIR generation on a background thread, then load viewers."""
+        has_dd = (self.scan_result and
+                  has_dicomdir(self.config.source_dir) and
+                  processed > 0 and
+                  not self._cancel_event.is_set())
+
+        self.lbl_status.setText("Post-processing...")
+
+        self._post_thread = QThread()
+        self._post_worker = PostProcessingWorker(self.config, has_dd)
+        self._post_worker.moveToThread(self._post_thread)
+
+        self._post_thread.started.connect(self._post_worker.run)
+        self._post_worker.log_message.connect(self._log)
+        self._post_worker.finished.connect(
+            lambda: self._on_post_finished(processed)
+        )
+        self._post_worker.error.connect(
+            lambda msg: self._log(f"Post-processing error: {msg}")
+        )
+
+        self._post_thread.start()
+
+    def _on_post_finished(self, processed: int):
+        if self._post_thread and self._post_thread.isRunning():
+            self._post_thread.quit()
+            self._post_thread.wait()
+        self._post_thread = None
+
+        self.lbl_status.setText("Complete")
+
+        # Load viewers (fast — just file listing + loading first file)
+        self._load_output_viewers()
+
+        # Auto-verify if enabled
+        if self.config.auto_verify and processed > 0:
+            self._run_verification()
+        else:
+            self.right_tabs.setCurrentIndex(1)
 
     def _open_output_folder(self):
         import subprocess
