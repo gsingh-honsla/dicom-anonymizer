@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QObject
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QMessageBox,
     QSplitter,
+    QTabWidget,
 )
 from PySide6.QtGui import QFont, QTextCursor
 
@@ -27,7 +29,15 @@ from ..core.scanner import scan_directory, get_patient_study_counts, ScanResult
 from ..core.anonymizer import Anonymizer, AnonymizationResult
 from ..core.writer import write_anonymized
 from ..audit.logger import AuditLogger
+from ..verification.verifier import Verifier, VerificationSummary
+from ..verification.report import export_html, export_json
+from ..core.dicomdir_handler import has_dicomdir, generate_dicomdir
 from ..utils.config import AnonymizationConfig, APP_NAME, APP_VERSION, APP_ORG
+
+from .summary_panel import SummaryPanel
+from .tag_browser import TagBrowser
+from .image_viewer import ImageViewer
+from .comparison_view import ComparisonView
 
 
 class AnonymizationWorker(QObject):
@@ -97,6 +107,8 @@ class AnonymizationWorker(QObject):
                     msg = f"OK {rel_name}: {len(result.tags_modified)} modified, {len(result.tags_removed)} removed, {len(result.uids_replaced)} UIDs"
                     if result.private_tags_removed:
                         msg += f", {result.private_tags_removed} private"
+                    if result.pixel_scrub and result.pixel_scrub.regions_redacted:
+                        msg += f", {result.pixel_scrub.regions_redacted} pixel regions redacted"
                     self.log_message.emit(msg)
 
                 except Exception as e:
@@ -117,6 +129,29 @@ class AnonymizationWorker(QObject):
         self.finished.emit(processed, failed, total_private)
 
 
+class VerificationWorker(QObject):
+    """Worker that runs verification in a background thread."""
+
+    progress = Signal(int, int, str)
+    log_message = Signal(str)
+    finished = Signal(object)  # VerificationSummary
+    error = Signal(str)
+
+    def __init__(self, output_dir: Path):
+        super().__init__()
+        self.output_dir = output_dir
+
+    def run(self):
+        try:
+            verifier = Verifier(self.output_dir)
+            summary = verifier.verify_directory(
+                progress_callback=lambda cur, tot, name: self.progress.emit(cur, tot, name)
+            )
+            self.finished.emit(summary)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     """Main application window with three-panel layout."""
 
@@ -125,11 +160,13 @@ class MainWindow(QMainWindow):
         self.config = AnonymizationConfig()
         self.scan_result: ScanResult | None = None
         self._worker_thread: QThread | None = None
+        self._verif_thread: QThread | None = None
         self._cancel_event = threading.Event()
+        self._start_time: float = 0
 
         self._setup_ui()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {APP_ORG}")
-        self.resize(1000, 700)
+        self.resize(1100, 750)
 
     def _setup_ui(self):
         central = QWidget()
@@ -147,18 +184,40 @@ class MainWindow(QMainWindow):
         left_widget.setLayout(left_panel)
         left_widget.setFixedWidth(260)
 
-        # Right panel
-        right_panel = QVBoxLayout()
-        right_panel.addWidget(self._create_status_group())
-        right_panel.addWidget(self._create_log_group(), stretch=1)
-        right_panel.addWidget(self._create_actions_group())
+        # Right panel — now a tab widget
+        self.right_tabs = QTabWidget()
 
-        right_widget = QWidget()
-        right_widget.setLayout(right_panel)
+        # Tab 1: Processing (log + progress + actions)
+        processing_tab = QWidget()
+        processing_layout = QVBoxLayout(processing_tab)
+        processing_layout.addWidget(self._create_status_group())
+        processing_layout.addWidget(self._create_log_group(), stretch=1)
+        processing_layout.addWidget(self._create_actions_group())
+        self.right_tabs.addTab(processing_tab, "Processing")
+
+        # Tab 2: Summary
+        self.summary_panel = SummaryPanel()
+        self.summary_panel.verify_clicked.connect(self._run_verification)
+        self.summary_panel.browse_tags_clicked.connect(self._open_tag_browser)
+        self.summary_panel.compare_clicked.connect(self._open_comparison)
+        self.right_tabs.addTab(self.summary_panel, "Summary")
+
+        # Tab 3: Tag Browser
+        self.tag_browser = TagBrowser()
+        self.right_tabs.addTab(self.tag_browser, "Tag Browser")
+
+        # Tab 4: Image Viewer
+        self.image_viewer = ImageViewer()
+        self.image_viewer.file_changed.connect(self._on_viewer_file_changed)
+        self.right_tabs.addTab(self.image_viewer, "Image Viewer")
+
+        # Tab 5: Comparison
+        self.comparison_view = ComparisonView()
+        self.right_tabs.addTab(self.comparison_view, "Comparison")
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
+        splitter.addWidget(self.right_tabs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         main_layout.addWidget(splitter)
@@ -206,9 +265,11 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.chk_strip_private)
 
-        self.chk_pixel_scrub = QCheckBox("Pixel scrubbing (Phase 3)")
-        self.chk_pixel_scrub.setChecked(False)
-        self.chk_pixel_scrub.setEnabled(False)
+        self.chk_pixel_scrub = QCheckBox("Pixel scrubbing (OCR + face)")
+        self.chk_pixel_scrub.setChecked(self.config.pixel_scrub)
+        self.chk_pixel_scrub.toggled.connect(
+            lambda v: setattr(self.config, "pixel_scrub", v)
+        )
         layout.addWidget(self.chk_pixel_scrub)
 
         self.chk_keep_dates = QCheckBox("Keep dates")
@@ -220,7 +281,9 @@ class MainWindow(QMainWindow):
 
         self.chk_auto_verify = QCheckBox("Auto-verify output")
         self.chk_auto_verify.setChecked(self.config.auto_verify)
-        self.chk_auto_verify.setEnabled(False)  # Phase 2
+        self.chk_auto_verify.toggled.connect(
+            lambda v: setattr(self.config, "auto_verify", v)
+        )
         layout.addWidget(self.chk_auto_verify)
 
         return group
@@ -305,7 +368,7 @@ class MainWindow(QMainWindow):
             return
 
         # Get patient/study counts
-        self.lbl_source_info.setText(f"Counting patients/studies...")
+        self.lbl_source_info.setText("Counting patients/studies...")
         counts = get_patient_study_counts(self.scan_result.dicom_files)
 
         info = (
@@ -324,6 +387,11 @@ class MainWindow(QMainWindow):
             self._log(f"Skipped {len(self.scan_result.skipped_files)} non-DICOM files")
         if self.scan_result.errors:
             self._log(f"Errors: {len(self.scan_result.errors)}")
+
+        # Load first file into image viewer and tag browser
+        if self.scan_result.dicom_files:
+            self.image_viewer.load_files(self.scan_result.dicom_files)
+            self.tag_browser.load_file(self.scan_result.dicom_files[0])
 
     def _select_output(self):
         folder = QFileDialog.getExistingDirectory(
@@ -347,10 +415,14 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(True)
         self.btn_open_output.setEnabled(False)
         self._cancel_event.clear()
+        self._start_time = time.monotonic()
 
         self.lbl_status.setText("Anonymizing...")
         self._log("=" * 50)
         self._log("Starting anonymization...")
+
+        # Switch to processing tab
+        self.right_tabs.setCurrentIndex(0)
 
         # Create worker
         self._worker_thread = QThread()
@@ -383,14 +455,38 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(False)
         self.btn_open_output.setEnabled(True)
 
+        elapsed = time.monotonic() - self._start_time
+        elapsed_str = f"{int(elapsed // 60)}:{int(elapsed % 60):02d}"
+
         status = "Complete" if not self._cancel_event.is_set() else "Cancelled"
         self.lbl_status.setText(status)
 
         self._log("=" * 50)
         self._log(f"{status}: {processed} files processed, {failed} failed")
         self._log(f"Private tags removed: {private_tags}")
+        self._log(f"Elapsed: {elapsed_str}")
         self._log(f"Output: {self.config.output_dir}")
         self._log(f"Audit log: {self.config.output_dir / 'audit.db'}")
+
+        # Update summary panel
+        self.summary_panel.set_anonymization_stats(
+            processed, failed, private_tags, elapsed_str
+        )
+
+        # Generate DICOMDIR if original had one
+        if (self.scan_result and
+                has_dicomdir(self.config.source_dir) and
+                processed > 0 and
+                not self._cancel_event.is_set()):
+            self._log("Generating DICOMDIR for output...")
+            try:
+                dicomdir_path = generate_dicomdir(self.config.output_dir)
+                self._log(f"DICOMDIR written: {dicomdir_path}")
+            except Exception as e:
+                self._log(f"DICOMDIR generation failed: {e}")
+
+        # Load anonymized files into viewers
+        self._load_output_viewers()
 
         if failed > 0:
             QMessageBox.warning(
@@ -398,6 +494,13 @@ class MainWindow(QMainWindow):
                 "Anonymization Complete",
                 f"Completed with {failed} failures.\nCheck the log for details.",
             )
+
+        # Auto-verify if enabled
+        if self.config.auto_verify and processed > 0:
+            self._run_verification()
+        else:
+            # Switch to summary tab
+            self.right_tabs.setCurrentIndex(1)
 
     def _on_error(self, message: str):
         self._cleanup_worker()
@@ -423,3 +526,121 @@ class MainWindow(QMainWindow):
         cursor = self.txt_log.textCursor()
         cursor.movePosition(QTextCursor.End)
         self.txt_log.setTextCursor(cursor)
+
+    # ── Verification ──────────────────────────────────────────
+
+    def _run_verification(self):
+        """Run post-anonymization verification on the output directory."""
+        if not self.config.output_dir.exists():
+            QMessageBox.warning(self, "Verification", "No output directory found.")
+            return
+
+        self.lbl_status.setText("Verifying...")
+        self._log("=" * 50)
+        self._log("Starting verification...")
+        self.summary_panel.btn_verify.setEnabled(False)
+        self.progress_bar.setValue(0)
+
+        self._verif_thread = QThread()
+        self._verif_worker = VerificationWorker(self.config.output_dir)
+        self._verif_worker.moveToThread(self._verif_thread)
+
+        self._verif_thread.started.connect(self._verif_worker.run)
+        self._verif_worker.progress.connect(self._on_verif_progress)
+        self._verif_worker.log_message.connect(self._log)
+        self._verif_worker.finished.connect(self._on_verif_finished)
+        self._verif_worker.error.connect(self._on_verif_error)
+
+        self._verif_thread.start()
+
+    def _on_verif_progress(self, current: int, total: int, filename: str):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.lbl_progress_detail.setText(f"Verifying {current}/{total}: {filename}")
+
+    def _on_verif_finished(self, summary: VerificationSummary):
+        self._cleanup_verif_worker()
+        self.summary_panel.btn_verify.setEnabled(True)
+
+        self.summary_panel.set_verification_results(summary, self.config.output_dir)
+
+        status = "Verified — ALL PASSED" if summary.all_passed else "Verified — ISSUES FOUND"
+        self.lbl_status.setText(status)
+
+        self._log(f"Verification: {summary.files_passed} passed, {summary.files_failed} failed, {summary.files_errored} errors")
+        self._log(f"Tag issues: {summary.total_tag_issues}, PHI detections: {summary.total_phi_issues}")
+
+        # Auto-export JSON report
+        try:
+            json_path = self.config.output_dir / "verification_report.json"
+            export_json(summary, json_path)
+            self._log(f"JSON report: {json_path}")
+        except Exception as e:
+            self._log(f"Failed to export JSON report: {e}")
+
+        # Switch to summary tab
+        self.right_tabs.setCurrentIndex(1)
+
+        if not summary.all_passed:
+            QMessageBox.warning(
+                self,
+                "Verification Issues",
+                f"{summary.files_failed} file(s) had issues.\n"
+                f"Tag issues: {summary.total_tag_issues}\n"
+                f"PHI detections: {summary.total_phi_issues}\n\n"
+                "Check the Summary tab for details.",
+            )
+
+    def _on_verif_error(self, message: str):
+        self._cleanup_verif_worker()
+        self.summary_panel.btn_verify.setEnabled(True)
+        self.lbl_status.setText("Verification Error")
+        self._log(f"VERIFICATION ERROR: {message}")
+        QMessageBox.critical(self, "Verification Error", message)
+
+    def _cleanup_verif_worker(self):
+        if self._verif_thread and self._verif_thread.isRunning():
+            self._verif_thread.quit()
+            self._verif_thread.wait()
+        self._verif_thread = None
+
+    # ── Viewer loading ────────────────────────────────────────
+
+    def _load_output_viewers(self):
+        """Load anonymized output files into the viewer widgets."""
+        output_scan = scan_directory(self.config.output_dir)
+        if output_scan.file_count == 0:
+            return
+
+        # Load anonymized files into image viewer
+        self.image_viewer.load_files(output_scan.dicom_files)
+
+        # Load first anonymized file into tag browser
+        if output_scan.dicom_files:
+            self.tag_browser.load_file(output_scan.dicom_files[0])
+
+        # Load comparison if we have both source and output
+        if self.scan_result and self.scan_result.dicom_files:
+            self.comparison_view.load_comparison(
+                source_dir=self.config.source_dir,
+                output_dir=self.config.output_dir,
+                original_files=self.scan_result.dicom_files,
+                anon_files=output_scan.dicom_files,
+            )
+
+    def _on_viewer_file_changed(self, index: int):
+        """When the image viewer changes file, update the tag browser."""
+        ds = self.image_viewer.current_dataset()
+        files = self.image_viewer._files
+        if ds is not None and 0 <= index < len(files):
+            self.tag_browser.load_dataset(ds, files[index])
+
+    # ── Tab shortcuts ─────────────────────────────────────────
+
+    def _open_tag_browser(self):
+        """Switch to the tag browser tab."""
+        self.right_tabs.setCurrentIndex(2)
+
+    def _open_comparison(self):
+        """Switch to the comparison tab."""
+        self.right_tabs.setCurrentIndex(4)

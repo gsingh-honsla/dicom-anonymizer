@@ -13,6 +13,7 @@ import pydicom
 from pydicom.dataset import Dataset
 
 from .hash_map import HashMapper
+from .pixel_scrubber import scrub_dataset, ScrubResult
 from .tag_profile import TAG_PROFILE, PHI_SOURCE_TAGS, Action
 from .uid_generator import UIDMap
 from ..utils.config import AnonymizationConfig
@@ -29,6 +30,7 @@ class AnonymizationResult:
     private_tags_removed: int = 0
     original_phi: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    pixel_scrub: ScrubResult | None = None
     success: bool = True
     error: str = ""
 
@@ -93,6 +95,22 @@ class Anonymizer:
         # Strip private tags
         if self.config.strip_private_tags:
             result.private_tags_removed = self._remove_private_tags(ds)
+
+        # Pixel scrubbing (OCR text detection + face detection)
+        if self.config.pixel_scrub:
+            try:
+                scrub = scrub_dataset(
+                    ds,
+                    known_phi=result.original_phi,
+                    detect_text=True,
+                    detect_faces=True,
+                    redact=True,
+                )
+                result.pixel_scrub = scrub
+                if scrub.warnings:
+                    result.warnings.extend(scrub.warnings)
+            except Exception as e:
+                result.warnings.append(f"Pixel scrubbing error: {e}")
 
         # Update MediaStorageSOPInstanceUID in file meta to match new SOPInstanceUID
         if hasattr(ds, "file_meta") and (0x0002, 0x0003) in ds.file_meta:
