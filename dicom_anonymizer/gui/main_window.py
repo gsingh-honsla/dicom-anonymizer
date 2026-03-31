@@ -171,8 +171,9 @@ class VerificationWorker(QObject):
 
 
 class PostProcessingWorker(QObject):
-    """Worker for DICOMDIR generation and viewer loading (avoids beach ball)."""
+    """Worker for DICOMDIR generation (avoids beach ball)."""
 
+    progress = Signal(int, int, str)   # current, total, message
     log_message = Signal(str)
     finished = Signal()
     error = Signal(str)
@@ -184,11 +185,13 @@ class PostProcessingWorker(QObject):
 
     def run(self):
         try:
-            # Generate DICOMDIR if original had one
             if self.has_source_dicomdir:
-                self.log_message.emit("Generating DICOMDIR for output...")
+                self.log_message.emit("Generating DICOMDIR index for output...")
                 try:
-                    dicomdir_path = generate_dicomdir(self.config.output_dir)
+                    dicomdir_path = generate_dicomdir(
+                        self.config.output_dir,
+                        progress_callback=lambda cur, tot, name: self.progress.emit(cur, tot, name),
+                    )
                     self.log_message.emit(f"DICOMDIR written: {dicomdir_path}")
                 except Exception as e:
                     self.log_message.emit(f"DICOMDIR generation failed: {e}")
@@ -632,13 +635,24 @@ class MainWindow(QMainWindow):
                   processed > 0 and
                   not self._cancel_event.is_set())
 
-        self.lbl_status.setText("Post-processing...")
+        # Disable UI during post-processing
+        self.btn_start.setEnabled(False)
+        self.btn_open_output.setEnabled(False)
+        self.right_tabs.setEnabled(False)
+
+        if has_dd:
+            self.lbl_status.setText("Generating DICOMDIR index...")
+            self.progress_bar.setValue(0)
+            self.lbl_progress_detail.setText("Building DICOMDIR...")
+        else:
+            self.lbl_status.setText("Finalizing...")
 
         self._post_thread = QThread()
         self._post_worker = PostProcessingWorker(self.config, has_dd)
         self._post_worker.moveToThread(self._post_thread)
 
         self._post_thread.started.connect(self._post_worker.run)
+        self._post_worker.progress.connect(self._on_post_progress)
         self._post_worker.log_message.connect(self._log)
         self._post_worker.finished.connect(
             lambda: self._on_post_finished(processed)
@@ -649,13 +663,24 @@ class MainWindow(QMainWindow):
 
         self._post_thread.start()
 
+    def _on_post_progress(self, current: int, total: int, filename: str):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.lbl_progress_detail.setText(f"DICOMDIR: {current}/{total} — {filename}")
+
     def _on_post_finished(self, processed: int):
         if self._post_thread and self._post_thread.isRunning():
             self._post_thread.quit()
             self._post_thread.wait()
         self._post_thread = None
 
+        # Re-enable UI
+        self.btn_start.setEnabled(True)
+        self.btn_open_output.setEnabled(True)
+        self.right_tabs.setEnabled(True)
+
         self.lbl_status.setText("Complete")
+        self.lbl_progress_detail.setText("")
 
         # Load viewers (fast — just file listing + loading first file)
         self._load_output_viewers()
