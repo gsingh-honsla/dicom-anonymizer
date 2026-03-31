@@ -635,6 +635,8 @@ class MainWindow(QMainWindow):
                   processed > 0 and
                   not self._cancel_event.is_set())
 
+        self._post_processed_count = processed
+
         # Disable UI during post-processing
         self.btn_start.setEnabled(False)
         self.btn_open_output.setEnabled(False)
@@ -654,12 +656,13 @@ class MainWindow(QMainWindow):
         self._post_thread.started.connect(self._post_worker.run)
         self._post_worker.progress.connect(self._on_post_progress)
         self._post_worker.log_message.connect(self._log)
-        self._post_worker.finished.connect(
-            lambda: self._on_post_finished(processed)
-        )
         self._post_worker.error.connect(
             lambda msg: self._log(f"Post-processing error: {msg}")
         )
+
+        # When worker finishes, quit the thread; when thread finishes, clean up
+        self._post_worker.finished.connect(self._post_thread.quit)
+        self._post_thread.finished.connect(self._on_post_finished)
 
         self._post_thread.start()
 
@@ -668,10 +671,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self.lbl_progress_detail.setText(f"DICOMDIR: {current}/{total} — {filename}")
 
-    def _on_post_finished(self, processed: int):
-        if self._post_thread and self._post_thread.isRunning():
-            self._post_thread.quit()
-            self._post_thread.wait()
+    def _on_post_finished(self):
         self._post_thread = None
 
         # Re-enable UI
@@ -686,6 +686,7 @@ class MainWindow(QMainWindow):
         self._load_output_viewers()
 
         # Auto-verify if enabled
+        processed = getattr(self, "_post_processed_count", 0)
         if self.config.auto_verify and processed > 0:
             self._run_verification()
         else:

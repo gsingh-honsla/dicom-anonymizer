@@ -132,8 +132,8 @@ app = BUNDLE(
     bundle_identifier="com.globusmedical.dicom-anonymizer",
     info_plist={
         "CFBundleDisplayName": "DICOM Anonymizer",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": "1.0.2",
+        "CFBundleVersion": "1.0.2",
         "NSHighResolutionCapable": True,
         "CFBundleDocumentTypes": [],
         "LSMinimumSystemVersion": "10.15.0",

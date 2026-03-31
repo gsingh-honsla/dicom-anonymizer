@@ -36,5 +36,5 @@ class AnonymizationConfig:
 
 
 APP_NAME = "DICOM Anonymizer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.2"
 APP_ORG = "Globus Medical"
