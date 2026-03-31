@@ -27,6 +27,10 @@ class AnonymizationConfig:
     # Age cap per HIPAA Safe Harbor
     max_age: int = 89  # Ages >= 90 are grouped as 090Y
 
+    # Safety
+    quarantine_risky_images: bool = True  # Exclude SC/dose reports with burned-in PHI
+    remove_failed_from_output: bool = True  # Delete output files that fail verification
+
     # Processing
     force_read: bool = True  # Use pydicom force=True for pre-Part 10 DICOM
 

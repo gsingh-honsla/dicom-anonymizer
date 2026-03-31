@@ -34,6 +34,7 @@ from ..verification.verifier import Verifier, VerificationSummary
 from ..verification.report import export_html, export_json
 from ..core.dicomdir_handler import has_dicomdir, generate_dicomdir
 from ..core.pixel_scrubber import check_availability as check_pixel_scrub
+from ..core.image_classifier import classify_file, PHIRisk
 from ..utils.config import AnonymizationConfig, APP_NAME, APP_VERSION, APP_ORG
 
 from .summary_panel import SummaryPanel
@@ -48,7 +49,7 @@ class AnonymizationWorker(QObject):
     progress = Signal(int, int, str)    # current, total, message
     file_done = Signal(str, bool)       # filename, success
     log_message = Signal(str)           # log line
-    finished = Signal(int, int, int)    # processed, failed, private_tags_total
+    finished = Signal(int, int, int, int)  # processed, failed, private_tags_total, quarantined
     error = Signal(str)                 # fatal error message
 
     def __init__(
@@ -81,16 +82,31 @@ class AnonymizationWorker(QObject):
         processed = 0
         failed = 0
         total_private = 0
+        quarantined = 0
 
         for i, file_path in enumerate(files):
             if self.cancel_event.is_set():
                 self.log_message.emit("Cancelled by user.")
                 audit.fail_run(run_id, processed, failed)
-                self.finished.emit(processed, failed, total_private)
+                self.finished.emit(processed, failed, total_private, quarantined)
                 return
 
             rel_name = file_path.name
             self.progress.emit(i + 1, total, rel_name)
+
+            # Classify image for burned-in PHI risk
+            if self.config.quarantine_risky_images:
+                try:
+                    classification = classify_file(file_path)
+                    if classification.risk == PHIRisk.DANGEROUS:
+                        quarantined += 1
+                        self.log_message.emit(
+                            f"QUARANTINED {rel_name}: {classification.reason}"
+                        )
+                        self.file_done.emit(rel_name, True)
+                        continue
+                except Exception:
+                    pass  # If classification fails, proceed with anonymization
 
             ds, result = anonymizer.anonymize_file(file_path)
 
@@ -128,7 +144,7 @@ class AnonymizationWorker(QObject):
 
         audit.complete_run(run_id, processed, failed)
         audit.close()
-        self.finished.emit(processed, failed, total_private)
+        self.finished.emit(processed, failed, total_private, quarantined)
 
 
 class VerificationWorker(QObject):
@@ -322,6 +338,28 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.chk_auto_verify)
 
+        self.chk_quarantine = QCheckBox("Quarantine risky images")
+        self.chk_quarantine.setChecked(self.config.quarantine_risky_images)
+        self.chk_quarantine.setToolTip(
+            "Exclude dose reports, protocol summaries, and other\n"
+            "secondary captures with burned-in PHI from output"
+        )
+        self.chk_quarantine.toggled.connect(
+            lambda v: setattr(self.config, "quarantine_risky_images", v)
+        )
+        layout.addWidget(self.chk_quarantine)
+
+        self.chk_clean_output = QCheckBox("Remove failed files")
+        self.chk_clean_output.setChecked(self.config.remove_failed_from_output)
+        self.chk_clean_output.setToolTip(
+            "Delete output files that fail verification\n"
+            "to ensure no PHI remains in the output"
+        )
+        self.chk_clean_output.toggled.connect(
+            lambda v: setattr(self.config, "remove_failed_from_output", v)
+        )
+        layout.addWidget(self.chk_clean_output)
+
         return group
 
     def _create_status_group(self) -> QGroupBox:
@@ -507,7 +545,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self.lbl_progress_detail.setText(f"{current} / {total}: {filename}")
 
-    def _on_finished(self, processed: int, failed: int, private_tags: int):
+    def _on_finished(self, processed: int, failed: int, private_tags: int, quarantined: int = 0):
         self._cleanup_worker()
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
@@ -521,6 +559,8 @@ class MainWindow(QMainWindow):
 
         self._log("=" * 50)
         self._log(f"{status}: {processed} files processed, {failed} failed")
+        if quarantined:
+            self._log(f"Quarantined (burned-in PHI): {quarantined} files excluded from output")
         self._log(f"Private tags removed: {private_tags}")
         self._log(f"Elapsed: {elapsed_str}")
         self._log(f"Output: {self.config.output_dir}")
@@ -640,13 +680,27 @@ class MainWindow(QMainWindow):
         self.right_tabs.setCurrentIndex(1)
 
         if not summary.all_passed:
+            # Remove failed files from output if configured
+            if self.config.remove_failed_from_output:
+                removed = 0
+                for fv in summary.file_results:
+                    if not fv.passed and fv.output_path.exists():
+                        try:
+                            fv.output_path.unlink()
+                            removed += 1
+                        except Exception:
+                            pass
+                if removed:
+                    self._log(f"Removed {removed} file(s) with PHI issues from output")
+
             QMessageBox.warning(
                 self,
                 "Verification Issues",
                 f"{summary.files_failed} file(s) had issues.\n"
                 f"Tag issues: {summary.total_tag_issues}\n"
                 f"PHI detections: {summary.total_phi_issues}\n\n"
-                "Check the Summary tab for details.",
+                + (f"Removed {removed} failed file(s) from output.\n" if self.config.remove_failed_from_output else "")
+                + "Check the Summary tab for details.",
             )
 
     def _on_verif_error(self, message: str):
