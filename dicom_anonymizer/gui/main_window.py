@@ -36,6 +36,7 @@ from ..core.dicomdir_handler import has_dicomdir, generate_dicomdir
 from ..core.pixel_scrubber import check_availability as check_pixel_scrub
 from ..core.image_classifier import classify_file, PHIRisk
 from ..utils.config import AnonymizationConfig, APP_NAME, APP_VERSION, APP_ORG
+from ..utils.dependency_check import run_check, format_report
 
 from .summary_panel import SummaryPanel
 from .tag_browser import TagBrowser
@@ -87,7 +88,10 @@ class AnonymizationWorker(QObject):
         for i, file_path in enumerate(files):
             if self.cancel_event.is_set():
                 self.log_message.emit("Cancelled by user.")
-                audit.fail_run(run_id, processed, failed)
+                try:
+                    audit.fail_run(run_id, processed, failed)
+                except Exception:
+                    pass
                 self.finished.emit(processed, failed, total_private, quarantined)
                 return
 
@@ -103,6 +107,15 @@ class AnonymizationWorker(QObject):
                         self.log_message.emit(
                             f"QUARANTINED {rel_name}: {classification.reason}"
                         )
+                        # Copy original to _quarantine/ folder for review
+                        try:
+                            relative = file_path.relative_to(self.config.source_dir)
+                            q_path = self.config.output_dir / "_quarantine" / relative
+                            q_path.parent.mkdir(parents=True, exist_ok=True)
+                            import shutil
+                            shutil.copy2(str(file_path), str(q_path))
+                        except Exception:
+                            pass  # Don't fail the run if quarantine copy fails
                         self.file_done.emit(rel_name, True)
                         continue
                 except Exception:
@@ -118,7 +131,10 @@ class AnonymizationWorker(QObject):
                         self.config.source_dir,
                         self.config.output_dir,
                     )
-                    audit.log_file(run_id, result, output_path, file_hash)
+                    try:
+                        audit.log_file(run_id, result, output_path, file_hash)
+                    except Exception:
+                        pass  # Audit failure must not block anonymization
                     processed += 1
                     total_private += result.private_tags_removed
 
@@ -132,18 +148,28 @@ class AnonymizationWorker(QObject):
                 except Exception as e:
                     result.success = False
                     result.error = str(e)
-                    audit.log_file(run_id, result)
+                    try:
+                        audit.log_file(run_id, result)
+                    except Exception:
+                        pass
                     failed += 1
                     self.log_message.emit(f"WRITE ERROR {rel_name}: {e}")
             else:
-                audit.log_file(run_id, result)
+                try:
+                    audit.log_file(run_id, result)
+                except Exception:
+                    pass
                 failed += 1
                 self.log_message.emit(f"FAIL {rel_name}: {result.error}")
 
             self.file_done.emit(rel_name, result.success)
 
-        audit.complete_run(run_id, processed, failed)
-        audit.close()
+        try:
+            audit.complete_run(run_id, processed, failed)
+        except Exception:
+            self.log_message.emit("WARNING: Audit log may be incomplete (disk I/O)")
+        finally:
+            audit.close()
         self.finished.emit(processed, failed, total_private, quarantined)
 
 
@@ -186,15 +212,14 @@ class PostProcessingWorker(QObject):
     def run(self):
         try:
             if self.has_source_dicomdir:
-                self.log_message.emit("Generating DICOMDIR index for output...")
-                try:
-                    dicomdir_path = generate_dicomdir(
-                        self.config.output_dir,
-                        progress_callback=lambda cur, tot, name: self.progress.emit(cur, tot, name),
-                    )
-                    self.log_message.emit(f"DICOMDIR written: {dicomdir_path}")
-                except Exception as e:
-                    self.log_message.emit(f"DICOMDIR generation failed: {e}")
+                # DICOMDIR generation is disabled — pydicom's FileSet creates
+                # synthetic paths (PT000000/...) that don't match our actual
+                # output structure, causing viewers like Horos to show blank
+                # results.  Modern viewers discover files by scanning the
+                # directory directly, so a DICOMDIR is not needed.
+                self.log_message.emit(
+                    "DICOMDIR skipped — viewers will scan files directly."
+                )
 
             self.finished.emit()
         except Exception as e:
@@ -218,6 +243,40 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {APP_ORG}")
         self.resize(1100, 750)
 
+        self._run_startup_check()
+
+    def _run_startup_check(self):
+        """Validate all dependencies at launch and warn if anything is wrong."""
+        report = run_check()
+        self._dep_report = report  # store for About dialog
+
+        # Log full report to the output panel
+        self._log("Dependency check:")
+        for line in format_report(report).splitlines():
+            self._log(f"  {line}")
+
+        if not report.all_required_ok:
+            missing = "\n".join(
+                f"  - {d.name}: {d.error}" for d in report.missing_required
+            )
+            QMessageBox.critical(
+                self,
+                "Missing Required Dependencies",
+                f"The following required components failed to load:\n\n"
+                f"{missing}\n\n"
+                f"The application may not function correctly.\n"
+                f"Please reinstall or rebuild the application.",
+            )
+
+        if report.missing_optional:
+            missing = "\n".join(
+                f"  - {d.name}: {d.error}" for d in report.missing_optional
+            )
+            self._log(
+                f"NOTE: Optional features unavailable:\n{missing}\n"
+                f"Core anonymization will still work."
+            )
+
     def _setup_menu(self):
         """Create the application menu bar."""
         menubar = self.menuBar()
@@ -231,10 +290,21 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         """Show the About dialog with version and dependency info."""
-        pixel_status = check_pixel_scrub()
-        ocr_status = "Available" if pixel_status["ocr"] else "Not installed (pip install easyocr)"
-        face_status = "Available" if pixel_status["face_detection"] else "Not available"
-        opencv_status = "Available" if pixel_status["opencv"] else "Not installed (pip install opencv-python-headless)"
+        report = getattr(self, "_dep_report", None)
+
+        dep_lines = ""
+        if report:
+            for dep in report.deps:
+                icon = "&#x2705;" if dep.loaded else "&#x274C;"
+                ver = f" v{dep.version}" if dep.version else ""
+                tag = "" if dep.required else " (optional)"
+                dep_lines += f"<li>{icon} {dep.name}{ver}{tag}</li>"
+            bundle = "PyInstaller bundle" if report.is_bundled else "Development mode"
+            platform_info = report.platform_info
+        else:
+            dep_lines = "<li>Run dependency check from Help menu</li>"
+            bundle = "Unknown"
+            platform_info = ""
 
         QMessageBox.about(
             self,
@@ -243,14 +313,9 @@ class MainWindow(QMainWindow):
             f"<p>{APP_ORG}</p>"
             f"<p>HIPAA-compliant DICOM anonymization tool for medical imaging data.</p>"
             f"<hr>"
-            f"<p><b>Capabilities:</b></p>"
-            f"<ul>"
-            f"<li>Tag anonymization: PS3.15 Annex E Basic Profile</li>"
-            f"<li>OCR text detection: {ocr_status}</li>"
-            f"<li>Face detection: {face_status}</li>"
-            f"<li>OpenCV: {opencv_status}</li>"
-            f"</ul>"
-            f"<p><small>Built with Python, pydicom, PySide6</small></p>"
+            f"<p><b>Dependencies:</b></p>"
+            f"<ul>{dep_lines}</ul>"
+            f"<p><small>{bundle} | {platform_info}</small></p>"
         )
 
     def _setup_ui(self):
@@ -457,7 +522,10 @@ class MainWindow(QMainWindow):
             status = check_pixel_scrub()
             missing = []
             if not status["ocr"]:
-                missing.append("easyocr (OCR text detection)")
+                ocr_msg = "easyocr (OCR text detection)"
+                if status.get("ocr_error"):
+                    ocr_msg += f"\n    Reason: {status['ocr_error']}"
+                missing.append(ocr_msg)
             if not status["opencv"]:
                 missing.append("opencv-python-headless (face detection)")
             elif not status["face_detection"]:
@@ -591,7 +659,10 @@ class MainWindow(QMainWindow):
         self._log("=" * 50)
         self._log(f"{status}: {processed} files processed, {failed} failed")
         if quarantined:
+            q_dir = self.config.output_dir / "_quarantine"
             self._log(f"Quarantined (burned-in PHI): {quarantined} files excluded from output")
+            self._log(f"Quarantine folder: {q_dir}")
+            self._log(f"  Review these files manually — if any are safe, move them to the output.")
         self._log(f"Private tags removed: {private_tags}")
         self._log(f"Elapsed: {elapsed_str}")
         self._log(f"Output: {self.config.output_dir}")
@@ -607,6 +678,18 @@ class MainWindow(QMainWindow):
                 self,
                 "Anonymization Complete",
                 f"Completed with {failed} failures.\nCheck the log for details.",
+            )
+
+        if quarantined > 0:
+            q_dir = self.config.output_dir / "_quarantine"
+            QMessageBox.information(
+                self,
+                "Quarantined Files",
+                f"{quarantined} file(s) were quarantined due to "
+                f"suspected burned-in PHI.\n\n"
+                f"Original copies saved to:\n{q_dir}\n\n"
+                f"Please review these files. If any are safe to include, "
+                f"anonymize them separately with quarantine disabled.",
             )
 
         # Run post-processing on a background thread to avoid beach ball

@@ -58,6 +58,9 @@ hiddenimports = [
     "pydicom.encoders.native",
     "pylibjpeg",
     "pylibjpeg.utils",
+    # JPEG codec native modules — import names differ from pip package names
+    "libjpeg",
+    "openjpeg",
 ]
 
 # Optional: easyocr + torch (for pixel scrubbing)
@@ -70,7 +73,17 @@ except ImportError:
 
 try:
     import torch
-    hiddenimports += ["torch", "torch.nn", "torch.nn.functional", "torchvision"]
+    # Collect ALL torch submodules — torch uses heavy dynamic imports that
+    # PyInstaller's static analysis misses, causing ImportError on target Macs.
+    hiddenimports += collect_submodules("torch")
+    datas += collect_data_files("torch")
+except ImportError:
+    pass
+
+try:
+    import torchvision
+    hiddenimports += collect_submodules("torchvision")
+    datas += collect_data_files("torchvision")
 except ImportError:
     pass
 
@@ -92,7 +105,7 @@ a = Analysis(
         "notebook",
         "tkinter",
         "test",
-        "unittest",
+        # NOTE: do NOT exclude "unittest" — torch/easyocr import it internally
     ],
     cipher=block_cipher,
     noarchive=False,

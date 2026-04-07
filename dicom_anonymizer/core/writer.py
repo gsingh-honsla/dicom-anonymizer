@@ -4,6 +4,8 @@ Writes anonymized DICOM datasets to an output directory,
 preserving the relative directory structure from the source.
 """
 
+from __future__ import annotations
+
 import hashlib
 from pathlib import Path
 
@@ -30,7 +32,9 @@ def write_anonymized(
     """Write an anonymized DICOM dataset to the output directory.
 
     Preserves the relative directory structure from source_root.
-    Saves as Explicit VR Little Endian (uncompressed) for maximum compatibility.
+    Uses write_like_original=True to preserve the original transfer syntax
+    and byte-level encoding of pixel data — only the anonymized tag values
+    change.  This ensures maximum viewer compatibility (Horos, OsiriX, etc.).
 
     Args:
         ds: Anonymized pydicom Dataset.
@@ -48,23 +52,27 @@ def write_anonymized(
     # Create parent directories
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure file meta info exists
+    # Ensure file meta info exists with valid entries
     if not hasattr(ds, "file_meta") or ds.file_meta is None:
         ds.file_meta = pydicom.dataset.FileMetaDataset()
+        ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
 
-    # Set transfer syntax to Explicit VR Little Endian
-    ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
-    ds.file_meta.MediaStorageSOPClassUID = getattr(
-        ds, "SOPClassUID", "1.2.840.10008.5.1.4.1.1.2"
-    )
+    # Keep the original TransferSyntaxUID — do NOT override it.
+    # Changing the transfer syntax without re-encoding pixel data
+    # produces corrupt files that viewers cannot read.
+
+    # Update MediaStorage UIDs to match the (possibly replaced) dataset UIDs
+    if hasattr(ds, "SOPClassUID"):
+        ds.file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
     if hasattr(ds, "SOPInstanceUID"):
         ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
 
-    # Ensure preamble
-    ds.preamble = b"\x00" * 128
+    # Ensure preamble exists (required for Part 10 DICOM)
+    if not hasattr(ds, "preamble") or ds.preamble is None:
+        ds.preamble = b"\x00" * 128
 
-    # Write
-    ds.save_as(str(output_path), write_like_original=False)
+    # Write with original encoding preserved — only anonymized tag values change
+    ds.save_as(str(output_path), write_like_original=True)
 
     # Compute hash of output file
     file_hash = compute_file_hash(output_path)

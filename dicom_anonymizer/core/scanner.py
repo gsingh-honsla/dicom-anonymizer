@@ -62,7 +62,9 @@ def scan_directory(
         result.errors.append((source_dir, "Not a directory"))
         return result
 
-    for root, _dirs, files in os.walk(source_dir):
+    for root, dirs, files in os.walk(source_dir):
+        # Skip quarantine and hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith(("_", "."))]
         root_path = Path(root)
         for filename in files:
             file_path = root_path / filename

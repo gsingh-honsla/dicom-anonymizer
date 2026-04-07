@@ -23,8 +23,10 @@ except ImportError:
 try:
     import easyocr
     _HAS_EASYOCR = True
-except ImportError:
+    _EASYOCR_ERROR = ""
+except Exception as _e:
     _HAS_EASYOCR = False
+    _EASYOCR_ERROR = str(_e)
 
 from pydicom.dataset import Dataset
 
@@ -139,6 +141,7 @@ def check_availability() -> dict[str, bool]:
     cascade_exists = _DEFAULT_CASCADE.exists() if _DEFAULT_CASCADE else False
     return {
         "ocr": _HAS_EASYOCR,
+        "ocr_error": _EASYOCR_ERROR,
         "face_detection": _HAS_CV2 and cascade_exists,
         "opencv": _HAS_CV2,
         "cascade_path": str(_DEFAULT_CASCADE) if cascade_exists else None,

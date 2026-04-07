@@ -2,27 +2,64 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from ..core.anonymizer import AnonymizationResult
 
+logger = logging.getLogger(__name__)
+
+_COMMIT_BATCH_SIZE = 50
+_MAX_RETRIES = 3
+_RETRY_DELAY = 0.5
+
 
 class AuditLogger:
-    """Logs all anonymization operations to a SQLite database."""
+    """Logs all anonymization operations to a SQLite database.
+
+    Designed for reliability on external drives (exFAT, FAT32, USB) commonly
+    used in hospital data collection.  Key resilience measures:
+    - Batched commits (every 50 files) to reduce fsync pressure
+    - Automatic retry with backoff for transient I/O errors
+    - DELETE journal mode instead of WAL for broader filesystem support
+    """
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._conn = None
+        self._pending = 0
         self._init_db()
+
+    def _execute_with_retry(self, fn, *args, **kwargs):
+        """Execute a database operation with retry logic for transient I/O errors."""
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if attempt == _MAX_RETRIES:
+                    logger.error("Audit DB error after %d retries: %s", _MAX_RETRIES, e)
+                    raise
+                logger.warning("Audit DB retry %d/%d: %s", attempt, _MAX_RETRIES, e)
+                time.sleep(_RETRY_DELAY * attempt)
+
+    def _commit(self, force: bool = False):
+        """Commit pending changes, batching by default for performance."""
+        self._pending += 1
+        if force or self._pending >= _COMMIT_BATCH_SIZE:
+            self._execute_with_retry(self._conn.commit)
+            self._pending = 0
 
     def _init_db(self):
         """Create the audit database and tables if they don't exist."""
-        self._conn = sqlite3.connect(str(self.db_path))
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = sqlite3.connect(str(self.db_path), timeout=30)
+        # Use DELETE journal mode — more compatible with external/USB drives
+        # than WAL, which requires shared-memory support the filesystem may lack.
+        self._conn.execute("PRAGMA journal_mode=DELETE")
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS anonymization_runs (
                 run_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +106,7 @@ class AuditLogger:
                 total_files,
             ),
         )
-        self._conn.commit()
+        self._commit(force=True)
         return cursor.lastrowid
 
     def log_file(
@@ -101,7 +138,7 @@ class AuditLogger:
                 result.error,
             ),
         )
-        self._conn.commit()
+        self._commit()
 
     def complete_run(self, run_id: int, files_processed: int, files_failed: int):
         """Record the completion of an anonymization run."""
@@ -117,7 +154,7 @@ class AuditLogger:
                 run_id,
             ),
         )
-        self._conn.commit()
+        self._commit(force=True)
 
     def fail_run(self, run_id: int, files_processed: int, files_failed: int):
         """Record a failed/cancelled run."""
@@ -133,10 +170,16 @@ class AuditLogger:
                 run_id,
             ),
         )
-        self._conn.commit()
+        self._commit(force=True)
 
     def close(self):
-        """Close the database connection."""
+        """Flush pending writes and close the database connection."""
         if self._conn:
+            if self._pending > 0:
+                try:
+                    self._conn.commit()
+                except sqlite3.OperationalError:
+                    logger.warning("Failed to flush audit log on close")
+                self._pending = 0
             self._conn.close()
             self._conn = None

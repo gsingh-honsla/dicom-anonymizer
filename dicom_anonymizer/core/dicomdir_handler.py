@@ -109,47 +109,59 @@ def generate_dicomdir(
     if scan.file_count == 0:
         raise RuntimeError("No DICOM files found in output directory")
 
-    # Build FileSet in a temp directory to avoid overwriting output files
-    staging_dir = Path(tempfile.mkdtemp(prefix="dicomdir_staging_"))
+    # Build FileSet directly in the output directory so that
+    # ReferencedFileID entries use the correct relative paths.
+    fs = FileSet()
+    total = scan.file_count
+    added = 0
+    errors = []
 
-    try:
-        fs = FileSet()
-        total = scan.file_count
-        added = 0
-        errors = []
+    for i, file_path in enumerate(scan.dicom_files):
+        if progress_callback:
+            progress_callback(i + 1, total, file_path.name)
 
-        for i, file_path in enumerate(scan.dicom_files):
-            if progress_callback:
-                progress_callback(i + 1, total, file_path.name)
+        try:
+            ds = pydicom.dcmread(str(file_path))
+            _fill_required_placeholders(ds)
 
-            try:
-                ds = pydicom.dcmread(str(file_path))
-                _fill_required_placeholders(ds)
-                fs.add(ds)
-                added += 1
-            except Exception as e:
-                errors.append((file_path.name, str(e)))
+            # Compute the path relative to output_dir so the DICOMDIR
+            # stores the real on-disk location of each file.
+            rel_path = file_path.relative_to(output_dir)
+            path_components = list(rel_path.parts)
 
-        if added == 0:
-            raise RuntimeError(
-                f"Could not add any files to DICOMDIR. "
-                f"Errors: {errors[:5]}"
-            )
+            fs.add(ds)
+            # Override the auto-generated path with the actual file location
+            instance = fs._instances[-1]
+            instance.ReferencedFileID = path_components
+            instance._file_id = str(rel_path)
 
-        # Write FileSet to staging directory
-        fs.write(staging_dir)
+            added += 1
+        except Exception as e:
+            errors.append((file_path.name, str(e)))
 
-        # Copy only the DICOMDIR file to the output directory
-        staged_dicomdir = staging_dir / "DICOMDIR"
-        output_dicomdir = output_dir / "DICOMDIR"
+    if added == 0:
+        raise RuntimeError(
+            f"Could not add any files to DICOMDIR. "
+            f"Errors: {errors[:5]}"
+        )
 
-        if staged_dicomdir.exists():
-            shutil.copy2(str(staged_dicomdir), str(output_dicomdir))
-        else:
-            raise RuntimeError("FileSet.write() did not produce a DICOMDIR file")
+    # Write the DICOMDIR into the output directory
+    output_dicomdir = output_dir / "DICOMDIR"
 
-        return output_dicomdir
+    # Remove old DICOMDIR if present
+    if output_dicomdir.exists():
+        output_dicomdir.unlink()
 
-    finally:
-        # Clean up staging directory
-        shutil.rmtree(staging_dir, ignore_errors=True)
+    fs.write(output_dir)
+
+    # FileSet.write() may also rewrite the DICOM files with new paths.
+    # We don't want that — delete any FileSet-generated directories
+    # (PT000000, etc.) and keep only the DICOMDIR.
+    for item in output_dir.iterdir():
+        if item.is_dir() and item.name.startswith("PT"):
+            shutil.rmtree(item)
+
+    if not output_dicomdir.exists():
+        raise RuntimeError("FileSet.write() did not produce a DICOMDIR file")
+
+    return output_dicomdir
